@@ -1,0 +1,13 @@
+{
+  "name": "mev-alpha-tracker",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "tracker.js",
+  "scripts": {
+    "start": "node tracker.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Arbitrum WETH-ARB Arbitrage Tracker",
+  "description": "Production MEV arbitrage price discrepancy monitor and flash loan execution engine for Uniswap V3 and SushiSwap V2 on Arbitrum One.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

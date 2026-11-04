@@ -197,9 +197,164 @@ main().catch((err) => {
   console.error("Fatal exception in tracker main():", err);
 });`;
 
+const CONTRACT_SOLIDITY = `// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+interface IFlashLoanSimpleReceiver {
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool);
+}
+
+interface IPool {
+    function flashLoanSimple(
+        address receiverAddress,
+        address asset,
+        uint256 amount,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
+}
+
+interface ISwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+interface IUniswapV2Router {
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
+    address public immutable owner;
+
+    address public constant WETH = 0x82aF49447D8a07e3bd95BD0d56f352415231C611;
+    address public constant ARB = 0x912CE59144191C1204E64559FE8253a0e49E6548;
+    address public constant AAVE_POOL = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
+    address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address public constant SUSHISWAP_ROUTER = 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506;
+
+    uint24 public constant POOL_FEE = 500;
+    uint256 public constant LOAN_AMOUNT = 10 ether;
+    uint256 public constant MIN_RETURN_REQUIRED = 10.005 ether;
+
+    event ArbitrageExecuted(uint256 indexed loanAmount, uint256 arbReceived, uint256 wethReturned, uint256 profit);
+    event EmergencyWithdrawal(address indexed token, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can execute");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function executeFlashLoan() external onlyOwner {
+        IPool(AAVE_POOL).flashLoanSimple(address(this), WETH, LOAN_AMOUNT, "", 0);
+    }
+
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external override returns (bool) {
+        require(msg.sender == AAVE_POOL, "Caller must be Aave Pool");
+        require(initiator == address(this), "Initiator must be this contract");
+        require(asset == WETH, "Asset must be WETH");
+
+        uint256 totalRepayment = amount + premium;
+
+        IERC20(WETH).approve(UNISWAP_V3_ROUTER, amount);
+        ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
+            tokenIn: WETH,
+            tokenOut: ARB,
+            fee: POOL_FEE,
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: amount,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0
+        });
+
+        uint256 arbReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
+        require(arbReceived > 0, "Uniswap V3 swap returned 0 ARB");
+
+        IERC20(ARB).approve(SUSHISWAP_ROUTER, arbReceived);
+        address[] memory path = new address[](2);
+        path[0] = ARB;
+        path[1] = WETH;
+
+        uint256[] memory amountsOut = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
+            arbReceived,
+            totalRepayment,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 wethReturned = amountsOut[1];
+        require(wethReturned >= MIN_RETURN_REQUIRED, "Return below 10.005 WETH threshold");
+        require(wethReturned > totalRepayment, "Trade is not profitable");
+
+        IERC20(WETH).approve(AAVE_POOL, totalRepayment);
+        uint256 profit = wethReturned - totalRepayment;
+        IERC20(WETH).transfer(owner, profit);
+
+        emit ArbitrageExecuted(amount, arbReceived, wethReturned, profit);
+        return true;
+    }
+
+    function emergencyWithdraw(address token) external onlyOwner {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        require(balance > 0, "No balance to withdraw");
+        IERC20(token).transfer(owner, balance);
+        emit EmergencyWithdrawal(token, balance);
+    }
+
+    function emergencyWithdrawETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to withdraw");
+        (bool success, ) = owner.call{value: balance}("");
+        require(success, "ETH transfer failed");
+    }
+
+    receive() external payable {}
+}`;
+
 export default function App() {
-  const [copied, setCopied] = useState(false);
-  const [activeTab, setActiveTab] = useState<"code" | "simulation" | "architecture">("code");
+  const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"code" | "contract" | "deploy" | "simulation" | "architecture">("deploy");
   const [simRunning, setSimRunning] = useState(false);
   const [simLogs, setSimLogs] = useState<string[]>([
     "Arbitrum WETH/ARB MEV Arbitrage Monitor Initialized.",
@@ -208,12 +363,6 @@ export default function App() {
   const [blockHeight, setBlockHeight] = useState(254890120);
   const [simulatedUniArb, setSimulatedUniArb] = useState(19500);
   const [simulatedSushiReturn, setSimulatedSushiReturn] = useState(10.002);
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(TRACKER_CODE);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
 
   useEffect(() => {
     let interval: NodeJS.Timeout;
@@ -226,7 +375,8 @@ export default function App() {
         const currentArb = Math.floor(19500 + (Math.random() - 0.5) * 80);
         setSimulatedUniArb(currentArb);
 
-        const netProfit = (currentReturn - 10.0).toFixed(6);
+        const profitVal = currentReturn - 10.0;
+        const netProfit = profitVal.toFixed(6);
         const isProfitable = currentReturn > 10.005;
 
         if (isProfitable) {
@@ -234,7 +384,7 @@ export default function App() {
           const log2 = `⚡ [OPPORTUNITY] Block #${blockHeight + 1} | Return: ${currentReturn} WETH > 10.005 WETH -> executeFlashLoan() DISPATCHED! Tx: 0x7f4a...e19b`;
           setSimLogs((prev) => [...prev.slice(-18), log1, log2]);
         } else {
-          const log = `[Block #${blockHeight + 1}] Input: 10 WETH -> UniV3: ${currentArb} ARB -> SushiV2: ${currentReturn} WETH | Net: ${netProfit > 0 ? "+" : ""}${netProfit} WETH (Threshold: 10.005 WETH)`;
+          const log = `[Block #${blockHeight + 1}] Input: 10 WETH -> UniV3: ${currentArb} ARB -> SushiV2: ${currentReturn} WETH | Net: ${profitVal > 0 ? "+" : ""}${netProfit} WETH (Threshold: 10.005 WETH)`;
           setSimLogs((prev) => [...prev.slice(-18), log]);
         }
       }, 1800);
@@ -262,19 +412,37 @@ export default function App() {
         </div>
 
         {/* Navigation Tabs */}
-        <div className="flex items-center bg-slate-800/80 p-1 rounded-lg border border-slate-700/60 text-sm">
+        <div className="flex items-center bg-slate-800/80 p-1 rounded-lg border border-slate-700/60 text-sm overflow-x-auto">
           <button
-            onClick={() => setActiveTab("code")}
-            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 ${
-              activeTab === "code" ? "bg-cyan-600 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
+            onClick={() => setActiveTab("deploy")}
+            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === "deploy" ? "bg-cyan-600 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <ShieldCheck className="h-4 w-4" />
+            Remix Deploy Guide
+          </button>
+          <button
+            onClick={() => setActiveTab("contract")}
+            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === "contract" ? "bg-cyan-600 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
             }`}
           >
             <Code2 className="h-4 w-4" />
+            ArbitrageFlashLoan.sol
+          </button>
+          <button
+            onClick={() => setActiveTab("code")}
+            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === "code" ? "bg-cyan-600 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Terminal className="h-4 w-4" />
             tracker.js
           </button>
           <button
             onClick={() => setActiveTab("simulation")}
-            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 whitespace-nowrap ${
               activeTab === "simulation" ? "bg-cyan-600 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
             }`}
           >
@@ -283,7 +451,7 @@ export default function App() {
           </button>
           <button
             onClick={() => setActiveTab("architecture")}
-            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 whitespace-nowrap ${
               activeTab === "architecture" ? "bg-cyan-600 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
             }`}
           >
@@ -341,7 +509,127 @@ export default function App() {
           </div>
         </div>
 
-        {/* Tab 1: Code View */}
+        {/* Tab: Remix Deploy Guide */}
+        {activeTab === "deploy" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-6 shadow-xl">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-5">
+              <div>
+                <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                  <ShieldCheck className="h-5 w-5 text-cyan-400" />
+                  Step-by-Step Contract Deployment via Remix IDE
+                </h2>
+                <p className="text-xs text-slate-400 mt-1">
+                  Follow these 5 straightforward steps to deploy <span className="font-mono text-cyan-300">ArbitrageFlashLoan.sol</span> on Arbitrum One.
+                </p>
+              </div>
+              <a
+                href="https://remix.ethereum.org"
+                target="_blank"
+                rel="noreferrer"
+                className="px-4 py-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-lg text-xs font-semibold flex items-center gap-2 transition w-fit shadow-md shadow-cyan-900/30"
+              >
+                Open Remix IDE <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-4">
+                <div className="p-4 bg-slate-950 rounded-xl border border-slate-800/80">
+                  <div className="flex items-center gap-2 font-semibold text-sm text-cyan-300">
+                    <span className="h-6 w-6 rounded-full bg-cyan-950 border border-cyan-800 text-cyan-300 flex items-center justify-center text-xs">1</span>
+                    Create File in Remix
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                    Open <span className="text-slate-200">remix.ethereum.org</span>, click the <strong>contracts</strong> folder, create a new file named <code className="text-cyan-300 font-mono">ArbitrageFlashLoan.sol</code>, and paste the code from the <em>ArbitrageFlashLoan.sol</em> tab.
+                  </p>
+                </div>
+
+                <div className="p-4 bg-slate-950 rounded-xl border border-slate-800/80">
+                  <div className="flex items-center gap-2 font-semibold text-sm text-cyan-300">
+                    <span className="h-6 w-6 rounded-full bg-cyan-950 border border-cyan-800 text-cyan-300 flex items-center justify-center text-xs">2</span>
+                    Compile with Solidity 0.8.20
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                    In the left sidebar, click the <strong>Solidity Compiler</strong> tab. Select compiler version <code className="text-cyan-300 font-mono">0.8.20</code> and click <strong>Compile ArbitrageFlashLoan.sol</strong>. Ensure optimization is enabled (runs: 200).
+                  </p>
+                </div>
+
+                <div className="p-4 bg-slate-950 rounded-xl border border-slate-800/80">
+                  <div className="flex items-center gap-2 font-semibold text-sm text-cyan-300">
+                    <span className="h-6 w-6 rounded-full bg-cyan-950 border border-cyan-800 text-cyan-300 flex items-center justify-center text-xs">3</span>
+                    Switch Environment to Injected Provider
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                    Go to the <strong>Deploy & Run Transactions</strong> tab. Under <em>Environment</em>, choose <strong>Injected Provider - MetaMask</strong>. Make sure your wallet is switched to the <strong className="text-cyan-300">Arbitrum One</strong> network.
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="p-4 bg-slate-950 rounded-xl border border-slate-800/80">
+                  <div className="flex items-center gap-2 font-semibold text-sm text-cyan-300">
+                    <span className="h-6 w-6 rounded-full bg-cyan-950 border border-cyan-800 text-cyan-300 flex items-center justify-center text-xs">4</span>
+                    Deploy Contract (Zero Parameters)
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                    Select <code className="text-cyan-300 font-mono">ArbitrageFlashLoan</code> from the contract dropdown. The constructor requires no arguments. Click the orange <strong>Deploy</strong> button and confirm the transaction in MetaMask (~$0.10 gas on Arbitrum).
+                  </p>
+                </div>
+
+                <div className="p-4 bg-slate-950 rounded-xl border border-slate-800/80">
+                  <div className="flex items-center gap-2 font-semibold text-sm text-cyan-300">
+                    <span className="h-6 w-6 rounded-full bg-cyan-950 border border-cyan-800 text-cyan-300 flex items-center justify-center text-xs">5</span>
+                    Paste Address into .env & Launch Bot
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                    Copy the deployed contract address from Remix's <em>Deployed Contracts</em> panel. Paste it into your <code className="text-cyan-300 font-mono">.env</code> under <code className="text-emerald-400 font-mono">CONTRACT_ADDRESS</code>, then start the daemon:
+                  </p>
+                  <pre className="mt-2 p-2 bg-slate-900 rounded font-mono text-[11px] text-cyan-300">
+                    node tracker.js
+                  </pre>
+                </div>
+
+                <div className="p-3 bg-amber-950/40 border border-amber-800/50 rounded-lg text-xs text-amber-300 flex items-start gap-2">
+                  <AlertCircle className="h-4 w-4 shrink-0 text-amber-400 mt-0.5" />
+                  <span>
+                    <strong>Owner Security:</strong> Only the deployer wallet can call <code className="font-mono">executeFlashLoan()</code>. Ensure the wallet in your <code className="font-mono">PRIVATE_KEY</code> is the deployer!
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Solidity Contract */}
+        {activeTab === "contract" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden flex flex-col shadow-2xl">
+            <div className="bg-slate-800/80 px-4 py-3 border-b border-slate-700/60 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Code2 className="h-4 w-4 text-cyan-400" />
+                <span className="text-xs font-mono font-semibold text-slate-200">contracts/ArbitrageFlashLoan.sol</span>
+                <span className="text-[11px] bg-slate-700/80 text-slate-300 px-2 py-0.5 rounded">Solidity 0.8.20</span>
+              </div>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(CONTRACT_SOLIDITY);
+                  setCopiedCode("sol");
+                  setTimeout(() => setCopiedCode(null), 2000);
+                }}
+                className="px-3 py-1.5 text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-100 rounded-md transition flex items-center gap-1.5 shadow"
+              >
+                {copiedCode === "sol" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                {copiedCode === "sol" ? "Copied Contract!" : "Copy Solidity Code"}
+              </button>
+            </div>
+            <div className="relative">
+              <pre className="p-5 font-mono text-xs text-slate-300 leading-relaxed overflow-x-auto max-h-[640px] bg-slate-950/70">
+                <code>{CONTRACT_SOLIDITY}</code>
+              </pre>
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Code View */}
         {activeTab === "code" && (
           <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden flex flex-col shadow-2xl">
             <div className="bg-slate-800/80 px-4 py-3 border-b border-slate-700/60 flex items-center justify-between">
@@ -351,11 +639,15 @@ export default function App() {
                 <span className="text-[11px] bg-slate-700/80 text-slate-300 px-2 py-0.5 rounded">ES Module (ethers v6)</span>
               </div>
               <button
-                onClick={handleCopy}
+                onClick={() => {
+                  navigator.clipboard.writeText(TRACKER_CODE);
+                  setCopiedCode("js");
+                  setTimeout(() => setCopiedCode(null), 2000);
+                }}
                 className="px-3 py-1.5 text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-100 rounded-md transition flex items-center gap-1.5 shadow"
               >
-                {copied ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                {copied ? "Copied Source!" : "Copy Code"}
+                {copiedCode === "js" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                {copiedCode === "js" ? "Copied Source!" : "Copy Code"}
               </button>
             </div>
             <div className="relative">

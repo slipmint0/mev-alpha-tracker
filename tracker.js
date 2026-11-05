@@ -31,7 +31,7 @@ const ARB = "0x912CE59144191C1204E64559FE8253a0e49E6548";
 const UNISWAP_V3_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 const SUSHISWAP_ROUTER = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
 
-// Address sanitizer to handle character typo in prompt ('l' instead of '6') and ensure valid EIP-55 checksum
+// Address sanitizer to handle character typos and ensure valid EIP-55 checksum
 const sanitizeAddress = (addr) => {
   if (!addr) return "0x0000000000000000000000000000000000000000";
   const cleaned = addr.replace(/l/gi, "6").toLowerCase();
@@ -53,6 +53,7 @@ const SUSHISWAP_ROUTER_ABI = [
 ];
 
 const ARBITRAGE_CONTRACT_ABI = [
+  "function executeFlashLoan(uint256 loanAmount, uint256 minIntermediateOut, uint256 minFinalReturn, uint8 direction, uint256 deadline) external",
   "function executeFlashLoan() external",
   "function executeFlashLoan(uint256 minArbOut, uint256 minWethOut, uint256 deadline) external",
 ];
@@ -60,7 +61,7 @@ const ARBITRAGE_CONTRACT_ABI = [
 // Configuration constants
 const POOL_FEE = 500; // 0.05% fee tier on Arbitrum Uniswap V3 WETH/ARB
 const LOAN_AMOUNT = ethers.parseEther("10"); // 10 WETH
-const MIN_RETURN_THRESHOLD = ethers.parseEther("10.005"); // 10.005 WETH (covers 10 WETH + 0.09% Aave premium + gas)
+const MIN_RETURN_THRESHOLD = ethers.parseEther("10.005"); // 10.005 WETH (covers 10 WETH + Aave 0.05% fee + gas buffer)
 
 // Initialize Provider, Signer Wallet, and Contracts
 let provider;
@@ -88,7 +89,9 @@ try {
 let isEvaluating = false;
 
 /**
- * Evaluates arbitrage profitability across Uniswap V3 and SushiSwap V2
+ * Evaluates arbitrage opportunities in both directions:
+ * Direction 0: Uniswap V3 (WETH -> ARB) -> SushiSwap V2 (ARB -> WETH)
+ * Direction 1: SushiSwap V2 (WETH -> ARB) -> Uniswap V3 (ARB -> WETH)
  * @param {number} blockNumber - Current block number on Arbitrum One
  */
 async function checkArbitrage(blockNumber) {
@@ -98,71 +101,125 @@ async function checkArbitrage(blockNumber) {
   isEvaluating = true;
 
   try {
-    // Query Uniswap V3 Quoter and SushiSwap V2 Router
-    // 1. Query Uniswap V3: swap 10 WETH -> ARB
-    const arbOut = await quoterContract.quoteExactInputSingle.staticCall(
-      WETH_ADDR,
-      ARB_ADDR,
-      POOL_FEE,
-      LOAN_AMOUNT,
-      0
-    );
+    // -------------------------------------------------------------
+    // Route 0: Uniswap V3 (Buy ARB) -> SushiSwap V2 (Sell ARB)
+    // -------------------------------------------------------------
+    let route0Return = 0n;
+    let route0ArbOut = 0n;
 
-    // 2. Query SushiSwap V2: sell exact ARB amount -> WETH
-    const amountsOut = await sushiRouterContract.getAmountsOut(arbOut, [
-      ARB_ADDR,
-      WETH_ADDR,
-    ]);
+    try {
+      route0ArbOut = await quoterContract.quoteExactInputSingle.staticCall(
+        WETH_ADDR,
+        ARB_ADDR,
+        POOL_FEE,
+        LOAN_AMOUNT,
+        0
+      );
 
-    const wethReturn = amountsOut[1];
+      const sushiAmounts0 = await sushiRouterContract.getAmountsOut(route0ArbOut, [
+        ARB_ADDR,
+        WETH_ADDR,
+      ]);
+      route0Return = sushiAmounts0[1];
+    } catch (_) {
+      // Swallowed on non-returning quote frames
+    }
 
-    const arbFormatted = ethers.formatUnits(arbOut, 18);
-    const returnFormatted = ethers.formatEther(wethReturn);
-    const profitFormatted = ethers.formatEther(wethReturn - LOAN_AMOUNT);
+    // -------------------------------------------------------------
+    // Route 1: SushiSwap V2 (Buy ARB) -> Uniswap V3 (Sell ARB)
+    // -------------------------------------------------------------
+    let route1Return = 0n;
+    let route1ArbOut = 0n;
 
-    // Log tracking metrics
-    console.log(
-      `[Block #${blockNumber}] Input: 10 WETH -> UniV3: ${Number(arbFormatted).toFixed(4)} ARB -> SushiV2: ${Number(returnFormatted).toFixed(6)} WETH | Net: ${profitFormatted} WETH`
-    );
+    try {
+      const sushiAmounts1 = await sushiRouterContract.getAmountsOut(LOAN_AMOUNT, [
+        WETH_ADDR,
+        ARB_ADDR,
+      ]);
+      route1ArbOut = sushiAmounts1[1];
 
-    // Check if return exceeds the 10.005 WETH threshold
-    if (wethReturn > MIN_RETURN_THRESHOLD) {
-      console.log("\n========================================================");
-      console.log("⚡ [PROFITABLE ARBITRAGE OPPORTUNITY DETECTED] ⚡");
-      console.log(`Block Number:              ${blockNumber}`);
-      console.log(`Loan Principal:            10.0 WETH`);
-      console.log(`Uniswap V3 Expected ARB:   ${arbFormatted} ARB`);
-      console.log(`SushiSwap V2 Return WETH:  ${returnFormatted} WETH`);
-      console.log(`Minimum Required WETH:     10.005 WETH`);
-      console.log(`Estimated Gross Profit:    +${ethers.formatEther(wethReturn - LOAN_AMOUNT)} WETH`);
-      console.log(`Estimated Net Profit:      +${ethers.formatEther(wethReturn - MIN_RETURN_THRESHOLD)} WETH`);
-      if (isExecutionEnabled && arbitrageContract) {
-        console.log("Calling executeFlashLoan() on custom arbitrage contract...");
+      route1Return = await quoterContract.quoteExactInputSingle.staticCall(
+        ARB_ADDR,
+        WETH_ADDR,
+        POOL_FEE,
+        route1ArbOut,
+        0
+      );
+    } catch (_) {
+      // Swallowed on non-returning quote frames
+    }
 
-        try {
-          let tx;
-          // Check if contract has parameters (minArbOut, minWethOut, deadline) or is parameterless
+    // Determine the most profitable route
+    const isRoute0Better = route0Return >= route1Return;
+    const bestReturn = isRoute0Better ? route0Return : route1Return;
+    const bestDirection = isRoute0Better ? 0 : 1; // 0 = Uni -> Sushi, 1 = Sushi -> Uni
+    const bestIntermediate = isRoute0Better ? route0ArbOut : route1ArbOut;
+    const routeName = isRoute0Better ? "UniV3 -> SushiV2" : "SushiV2 -> UniV3";
+
+    if (bestReturn > 0n) {
+      const formattedReturn = ethers.formatEther(bestReturn);
+      const profitFormatted = ethers.formatEther(bestReturn - LOAN_AMOUNT);
+
+      console.log(
+        `[Block #${blockNumber}] Input: 10 WETH | Best Route: [${routeName}] -> Return: ${Number(formattedReturn).toFixed(6)} WETH | Net: ${profitFormatted} WETH`
+      );
+
+      // Check if return exceeds the 10.005 WETH threshold
+      if (bestReturn > MIN_RETURN_THRESHOLD) {
+        console.log("\n========================================================");
+        console.log("⚡ [PROFITABLE MEV ARBITRAGE OPPORTUNITY DETECTED] ⚡");
+        console.log(`Block Number:              #${blockNumber}`);
+        console.log(`Route Direction:           ${routeName} (Direction ${bestDirection})`);
+        console.log(`Loan Principal:            10.0 WETH`);
+        console.log(`Intermediate ARB:          ${ethers.formatUnits(bestIntermediate, 18)} ARB`);
+        console.log(`Expected Return WETH:      ${formattedReturn} WETH`);
+        console.log(`Minimum Required WETH:     10.005 WETH`);
+        console.log(`Estimated Gross Profit:    +${ethers.formatEther(bestReturn - LOAN_AMOUNT)} WETH`);
+        console.log(`Estimated Net Spread:      +${ethers.formatEther(bestReturn - MIN_RETURN_THRESHOLD)} WETH`);
+
+        // Anti-Sandwich Protection: Calculate 0.5% max slippage barrier for Hop 1
+        const minIntermediateOut = (bestIntermediate * 995n) / 1000n;
+        const deadline = Math.floor(Date.now() / 1000) + 120; // 2 minute deadline
+
+        if (isExecutionEnabled && arbitrageContract) {
+          console.log("Calling executeFlashLoan() with dynamic slippage & MEV protection...");
           try {
-            const deadline = Math.floor(Date.now() / 1000) + 120; // 2 minute buffer
-            tx = await arbitrageContract.executeFlashLoan(arbOut, MIN_RETURN_THRESHOLD, deadline);
-          } catch (callErr) {
-            // Fallback to parameterless executeFlashLoan()
-            tx = await arbitrageContract.executeFlashLoan();
+            let tx;
+            // Attempt production 5-parameter call with anti-sandwich intermediate check
+            try {
+              tx = await arbitrageContract["executeFlashLoan(uint256,uint256,uint256,uint8,uint256)"](
+                LOAN_AMOUNT,
+                minIntermediateOut,
+                MIN_RETURN_THRESHOLD,
+                bestDirection,
+                deadline
+              );
+            } catch (_) {
+              // Backward-compatible fallback for 3-arg or 0-arg deployments
+              try {
+                tx = await arbitrageContract["executeFlashLoan(uint256,uint256,uint256)"](
+                  minIntermediateOut,
+                  MIN_RETURN_THRESHOLD,
+                  deadline
+                );
+              } catch (_) {
+                tx = await arbitrageContract.executeFlashLoan();
+              }
+            }
+            console.log(`Transaction dispatched. Hash: ${tx.hash}`);
+            const receipt = await tx.wait();
+            console.log(`Transaction confirmed in block #${receipt.blockNumber}! Gas Used: ${receipt.gasUsed.toString()}`);
+          } catch (txError) {
+            console.error("Execution failed on executeFlashLoan():", txError.message || txError);
           }
-          console.log(`Transaction dispatched. Hash: ${tx.hash}`);
-          const receipt = await tx.wait();
-          console.log(`Transaction confirmed in block #${receipt.blockNumber}! Gas Used: ${receipt.gasUsed.toString()}`);
-        } catch (txError) {
-          console.error("Execution failed on executeFlashLoan():", txError.message || txError);
+        } else {
+          console.log("ℹ️ [SIMULATION MODE] Opportunity detected! Anti-sandwich slippage barrier set at:", ethers.formatUnits(minIntermediateOut, 18), "ARB.");
         }
-      } else {
-        console.log("ℹ️ [SIMULATION MODE] Opportunity detected! Flash loan execution would trigger on-chain once keys are configured.");
-      }
 
-      console.log("========================================================\n");
+        console.log("========================================================\n");
+      }
     }
   } catch (error) {
-    // Catch RPC frame drops, network timeouts, or route errors gracefully
     console.warn(`[Block #${blockNumber}] Query error or RPC frame drop:`, error.shortMessage || error.message || error);
   } finally {
     isEvaluating = false;
@@ -174,7 +231,7 @@ async function checkArbitrage(blockNumber) {
  */
 async function main() {
   console.log("========================================================");
-  console.log("🚀 Arbitrum WETH/ARB MEV Arbitrage Monitor Started");
+  console.log("🚀 Arbitrum WETH/ARB Bidirectional MEV Arbitrage Monitor");
   if (isExecutionEnabled) {
     console.log(`Mode:                LIVE ON-CHAIN EXECUTION`);
     console.log(`Signer Address:      ${wallet.address}`);
@@ -187,6 +244,7 @@ async function main() {
   console.log(`SushiSwap Router:    ${SUSHISWAP_ADDR}`);
   console.log(`Loan Amount:         ${ethers.formatEther(LOAN_AMOUNT)} WETH`);
   console.log(`Profit Threshold:    ${ethers.formatEther(MIN_RETURN_THRESHOLD)} WETH`);
+  console.log(`Strategy:            Bidirectional (UniV3 ⇄ SushiV2) with Anti-Sandwich Protection`);
   console.log("========================================================");
 
   // Initial trigger to test RPC connectivity immediately

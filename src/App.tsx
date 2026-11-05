@@ -262,24 +262,69 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
     address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
     address public constant SUSHISWAP_ROUTER = 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506;
 
-    uint24 public constant POOL_FEE = 500;
-    uint256 public constant LOAN_AMOUNT = 10 ether;
-    uint256 public constant MIN_RETURN_REQUIRED = 10.005 ether;
+    uint24 public constant UNISWAP_POOL_FEE = 500;
 
-    event ArbitrageExecuted(uint256 indexed loanAmount, uint256 arbReceived, uint256 wethReturned, uint256 profit);
+    enum Direction { UNISWAP_TO_SUSHISWAP, SUSHISWAP_TO_UNISWAP }
+
+    struct ArbitrageParams {
+        uint256 loanAmount;
+        uint256 minIntermediateOut;
+        uint256 minFinalReturn;
+        Direction direction;
+        uint256 deadline;
+    }
+
+    event ArbitrageExecuted(uint256 indexed loanAmount, uint8 indexed direction, uint256 intermediateReceived, uint256 finalWethReceived, uint256 netProfit);
     event EmergencyWithdrawal(address indexed token, uint256 amount);
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can execute");
+        require(msg.sender == owner, "Unauthorized: only owner");
         _;
     }
 
     constructor() {
         owner = msg.sender;
+        IERC20(WETH).approve(UNISWAP_V3_ROUTER, type(uint256).max);
+        IERC20(WETH).approve(SUSHISWAP_ROUTER, type(uint256).max);
+        IERC20(WETH).approve(AAVE_POOL, type(uint256).max);
+        IERC20(ARB).approve(UNISWAP_V3_ROUTER, type(uint256).max);
+        IERC20(ARB).approve(SUSHISWAP_ROUTER, type(uint256).max);
+    }
+
+    function executeFlashLoan(
+        uint256 loanAmount,
+        uint256 minIntermediateOut,
+        uint256 minFinalReturn,
+        uint8 direction,
+        uint256 deadline
+    ) external onlyOwner {
+        require(block.timestamp <= deadline, "Transaction expired before execution");
+        require(loanAmount > 0, "Loan amount must be > 0");
+
+        bytes memory encodedParams = abi.encode(
+            ArbitrageParams({
+                loanAmount: loanAmount,
+                minIntermediateOut: minIntermediateOut,
+                minFinalReturn: minFinalReturn,
+                direction: Direction(direction),
+                deadline: deadline
+            })
+        );
+
+        IPool(AAVE_POOL).flashLoanSimple(address(this), WETH, loanAmount, encodedParams, 0);
     }
 
     function executeFlashLoan() external onlyOwner {
-        IPool(AAVE_POOL).flashLoanSimple(address(this), WETH, LOAN_AMOUNT, "", 0);
+        bytes memory encodedParams = abi.encode(
+            ArbitrageParams({
+                loanAmount: 10 ether,
+                minIntermediateOut: 1,
+                minFinalReturn: 10.005 ether,
+                direction: Direction.UNISWAP_TO_SUSHISWAP,
+                deadline: block.timestamp + 120
+            })
+        );
+        IPool(AAVE_POOL).flashLoanSimple(address(this), WETH, 10 ether, encodedParams, 0);
     }
 
     function executeOperation(
@@ -287,64 +332,91 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
         uint256 amount,
         uint256 premium,
         address initiator,
-        bytes calldata /* params */
+        bytes calldata params
     ) external override returns (bool) {
         require(msg.sender == AAVE_POOL, "Caller must be Aave Pool");
         require(initiator == address(this), "Initiator must be this contract");
         require(asset == WETH, "Asset must be WETH");
 
+        ArbitrageParams memory arbParams = abi.decode(params, (ArbitrageParams));
+        require(block.timestamp <= arbParams.deadline, "Deadline exceeded in callback");
+
         uint256 totalRepayment = amount + premium;
+        uint256 intermediateReceived;
+        uint256 finalWethReceived;
 
-        IERC20(WETH).approve(UNISWAP_V3_ROUTER, amount);
-        ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
-            tokenIn: WETH,
-            tokenOut: ARB,
-            fee: POOL_FEE,
-            recipient: address(this),
-            deadline: block.timestamp,
-            amountIn: amount,
-            amountOutMinimum: 0,
-            sqrtPriceLimitX96: 0
-        });
+        if (arbParams.direction == Direction.UNISWAP_TO_SUSHISWAP) {
+            ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
+                tokenIn: WETH,
+                tokenOut: ARB,
+                fee: UNISWAP_POOL_FEE,
+                recipient: address(this),
+                deadline: arbParams.deadline,
+                amountIn: amount,
+                amountOutMinimum: arbParams.minIntermediateOut,
+                sqrtPriceLimitX96: 0
+            });
+            intermediateReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
 
-        uint256 arbReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
-        require(arbReceived > 0, "Uniswap V3 swap returned 0 ARB");
+            address[] memory path = new address[](2);
+            path[0] = ARB;
+            path[1] = WETH;
 
-        IERC20(ARB).approve(SUSHISWAP_ROUTER, arbReceived);
-        address[] memory path = new address[](2);
-        path[0] = ARB;
-        path[1] = WETH;
+            uint256[] memory sushiAmounts = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
+                intermediateReceived,
+                arbParams.minFinalReturn,
+                path,
+                address(this),
+                arbParams.deadline
+            );
+            finalWethReceived = sushiAmounts[1];
+        } else {
+            address[] memory path = new address[](2);
+            path[0] = WETH;
+            path[1] = ARB;
 
-        uint256[] memory amountsOut = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
-            arbReceived,
-            totalRepayment,
-            path,
-            address(this),
-            block.timestamp
-        );
+            uint256[] memory sushiAmounts = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
+                amount,
+                arbParams.minIntermediateOut,
+                path,
+                address(this),
+                arbParams.deadline
+            );
+            intermediateReceived = sushiAmounts[1];
 
-        uint256 wethReturned = amountsOut[1];
-        require(wethReturned >= MIN_RETURN_REQUIRED, "Return below 10.005 WETH threshold");
-        require(wethReturned > totalRepayment, "Trade is not profitable");
+            ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
+                tokenIn: ARB,
+                tokenOut: WETH,
+                fee: UNISWAP_POOL_FEE,
+                recipient: address(this),
+                deadline: arbParams.deadline,
+                amountIn: intermediateReceived,
+                amountOutMinimum: arbParams.minFinalReturn,
+                sqrtPriceLimitX96: 0
+            });
+            finalWethReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
+        }
 
-        IERC20(WETH).approve(AAVE_POOL, totalRepayment);
-        uint256 profit = wethReturned - totalRepayment;
-        IERC20(WETH).transfer(owner, profit);
+        require(finalWethReceived >= arbParams.minFinalReturn, "Final return below requested threshold");
+        require(finalWethReceived > totalRepayment, "Negative or zero net arbitrage profit");
 
-        emit ArbitrageExecuted(amount, arbReceived, wethReturned, profit);
+        uint256 netProfit = finalWethReceived - totalRepayment;
+        IERC20(WETH).transfer(owner, netProfit);
+
+        emit ArbitrageExecuted(amount, uint8(arbParams.direction), intermediateReceived, finalWethReceived, netProfit);
         return true;
     }
 
     function emergencyWithdraw(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
-        require(balance > 0, "No balance to withdraw");
+        require(balance > 0, "No token balance");
         IERC20(token).transfer(owner, balance);
         emit EmergencyWithdrawal(token, balance);
     }
 
     function emergencyWithdrawETH() external onlyOwner {
         uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH to withdraw");
+        require(balance > 0, "No ETH balance");
         (bool success, ) = owner.call{value: balance}("");
         require(success, "ETH transfer failed");
     }

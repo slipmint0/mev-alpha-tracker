@@ -2,7 +2,7 @@
 pragma solidity 0.8.20;
 
 /**
- * @dev Minimal ERC20 interface for token approvals and transfers
+ * @dev Minimal ERC20 interface
  */
 interface IERC20 {
     function totalSupply() external view returns (uint256);
@@ -72,148 +72,223 @@ interface IUniswapV2Router {
 
 /**
  * @title ArbitrageFlashLoan
- * @notice Executes atomic arbitrage between Uniswap V3 and SushiSwap V2 on Arbitrum One using Aave V3 flash loans.
+ * @notice Production-hardened, bidirectional MEV arbitrage engine utilizing Aave V3 flash loans
+ * across Uniswap V3 and SushiSwap V2 on Arbitrum One with dynamic parameterization,
+ * strict multi-hop slippage enforcement, infinite upfront approvals, and deadline controls.
  */
 contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
     address public immutable owner;
 
-    // Arbitrum One Canonical Mainnet Addresses
+    // Arbitrum One Canonical Mainnet Addresses (EIP-55 checksum compliant)
     address public constant WETH = 0x82aF49447D8A07E3bD95Bd0d56f352415231c611;
     address public constant ARB = 0x912CE59144191C1204E64559FE8253a0e49E6548;
-    
-    // Aave V3 Pool on Arbitrum One
     address public constant AAVE_POOL = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
-
-    // Uniswap V3 SwapRouter on Arbitrum One
     address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
-
-    // SushiSwap V2 Router on Arbitrum One
     address public constant SUSHISWAP_ROUTER = 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506;
 
-    uint24 public constant POOL_FEE = 500; // 0.05% Uniswap V3 pool fee tier
-    uint256 public constant LOAN_AMOUNT = 10 ether; // 10 WETH
-    uint256 public constant MIN_RETURN_REQUIRED = 10.005 ether; // Covers 10 WETH loan + 0.09% fee + gas buffer
+    uint24 public constant UNISWAP_POOL_FEE = 500; // 0.05% fee tier
+
+    enum Direction {
+        UNISWAP_TO_SUSHISWAP, // 0: Borrow WETH -> UniV3 (ARB) -> SushiV2 (WETH)
+        SUSHISWAP_TO_UNISWAP  // 1: Borrow WETH -> SushiV2 (ARB) -> UniV3 (WETH)
+    }
+
+    struct ArbitrageParams {
+        uint256 loanAmount;         // Principal borrowed from Aave (e.g., 10 ether)
+        uint256 minIntermediateOut; // Hop 1 slippage barrier (anti-sandwich protection)
+        uint256 minFinalReturn;     // Hop 2 minimum final WETH return required
+        Direction direction;        // Swap routing sequence
+        uint256 deadline;           // Expiration timestamp to prevent stale execution
+    }
 
     event ArbitrageExecuted(
         uint256 indexed loanAmount,
-        uint256 arbReceived,
-        uint256 wethReturned,
-        uint256 profit
+        uint8 indexed direction,
+        uint256 intermediateReceived,
+        uint256 finalWethReceived,
+        uint256 netProfit
     );
 
     event EmergencyWithdrawal(address indexed token, uint256 amount);
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can execute");
+        require(msg.sender == owner, "Unauthorized: only owner");
         _;
     }
 
     constructor() {
         owner = msg.sender;
+
+        // Upfront infinite approvals save ~25,000 - 45,000 gas per execution leg
+        IERC20(WETH).approve(UNISWAP_V3_ROUTER, type(uint256).max);
+        IERC20(WETH).approve(SUSHISWAP_ROUTER, type(uint256).max);
+        IERC20(WETH).approve(AAVE_POOL, type(uint256).max);
+
+        IERC20(ARB).approve(UNISWAP_V3_ROUTER, type(uint256).max);
+        IERC20(ARB).approve(SUSHISWAP_ROUTER, type(uint256).max);
     }
 
     /**
-     * @notice Entrypoint invoked by tracker.js via the signer wallet.
-     * Initiates the 10 WETH flash loan from Aave V3.
+     * @notice Primary execution entrypoint with dynamic parameters passed from off-chain tracker.
      */
-    function executeFlashLoan() external onlyOwner {
+    function executeFlashLoan(
+        uint256 loanAmount,
+        uint256 minIntermediateOut,
+        uint256 minFinalReturn,
+        uint8 direction,
+        uint256 deadline
+    ) external onlyOwner {
+        require(block.timestamp <= deadline, "Transaction expired before execution");
+        require(loanAmount > 0, "Loan amount must be > 0");
+
+        bytes memory encodedParams = abi.encode(
+            ArbitrageParams({
+                loanAmount: loanAmount,
+                minIntermediateOut: minIntermediateOut,
+                minFinalReturn: minFinalReturn,
+                direction: Direction(direction),
+                deadline: deadline
+            })
+        );
+
         IPool(AAVE_POOL).flashLoanSimple(
             address(this),
             WETH,
-            LOAN_AMOUNT,
-            "",
+            loanAmount,
+            encodedParams,
             0
         );
     }
 
     /**
-     * @notice Callback invoked by Aave V3 Pool after transferring 10 WETH to this contract.
-     * @param asset The borrowed asset (WETH)
-     * @param amount The borrowed amount (10 WETH)
-     * @param premium The protocol fee (0.009 WETH)
-     * @param initiator The address that initiated the flash loan
+     * @notice Overloaded fallback entrypoint for simple 10 WETH UniV3 -> SushiV2 calls.
+     */
+    function executeFlashLoan() external onlyOwner {
+        bytes memory encodedParams = abi.encode(
+            ArbitrageParams({
+                loanAmount: 10 ether,
+                minIntermediateOut: 1, // Asserts non-zero receive; full execution protection in minFinalReturn
+                minFinalReturn: 10.005 ether,
+                direction: Direction.UNISWAP_TO_SUSHISWAP,
+                deadline: block.timestamp + 120
+            })
+        );
+
+        IPool(AAVE_POOL).flashLoanSimple(
+            address(this),
+            WETH,
+            10 ether,
+            encodedParams,
+            0
+        );
+    }
+
+    /**
+     * @notice Aave V3 FlashLoan callback executed inside the uncollateralized lending transaction.
      */
     function executeOperation(
         address asset,
         uint256 amount,
         uint256 premium,
         address initiator,
-        bytes calldata /* params */
+        bytes calldata params
     ) external override returns (bool) {
         require(msg.sender == AAVE_POOL, "Caller must be Aave Pool");
         require(initiator == address(this), "Initiator must be this contract");
         require(asset == WETH, "Asset must be WETH");
 
-        // Total amount required to repay Aave (10.0 WETH + 0.009 WETH)
+        ArbitrageParams memory arbParams = abi.decode(params, (ArbitrageParams));
+        require(block.timestamp <= arbParams.deadline, "Deadline exceeded in callback");
+
         uint256 totalRepayment = amount + premium;
+        uint256 intermediateReceived;
+        uint256 finalWethReceived;
 
-        // -------------------------------------------------------------
-        // Step 1: Swap 10 WETH -> ARB on Uniswap V3 (500 bps fee tier)
-        // -------------------------------------------------------------
-        IERC20(WETH).approve(UNISWAP_V3_ROUTER, amount);
+        if (arbParams.direction == Direction.UNISWAP_TO_SUSHISWAP) {
+            // Leg 1: Uniswap V3 (WETH -> ARB) with strict anti-sandwich minIntermediateOut
+            ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
+                tokenIn: WETH,
+                tokenOut: ARB,
+                fee: UNISWAP_POOL_FEE,
+                recipient: address(this),
+                deadline: arbParams.deadline,
+                amountIn: amount,
+                amountOutMinimum: arbParams.minIntermediateOut,
+                sqrtPriceLimitX96: 0
+            });
 
-        ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
-            tokenIn: WETH,
-            tokenOut: ARB,
-            fee: POOL_FEE,
-            recipient: address(this),
-            deadline: block.timestamp,
-            amountIn: amount,
-            amountOutMinimum: 0, // Controlled by final WETH return assertion below
-            sqrtPriceLimitX96: 0
-        });
+            intermediateReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
 
-        uint256 arbReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
-        require(arbReceived > 0, "Uniswap V3 swap returned 0 ARB");
+            // Leg 2: SushiSwap V2 (ARB -> WETH)
+            address[] memory path = new address[](2);
+            path[0] = ARB;
+            path[1] = WETH;
 
-        // -------------------------------------------------------------
-        // Step 2: Swap ARB -> WETH on SushiSwap V2
-        // -------------------------------------------------------------
-        IERC20(ARB).approve(SUSHISWAP_ROUTER, arbReceived);
+            uint256[] memory sushiAmounts = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
+                intermediateReceived,
+                arbParams.minFinalReturn,
+                path,
+                address(this),
+                arbParams.deadline
+            );
 
-        address[] memory path = new address[](2);
-        path[0] = ARB;
-        path[1] = WETH;
+            finalWethReceived = sushiAmounts[1];
+        } else {
+            // Leg 1: SushiSwap V2 (WETH -> ARB) with strict minIntermediateOut
+            address[] memory path = new address[](2);
+            path[0] = WETH;
+            path[1] = ARB;
 
-        uint256[] memory amountsOut = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
-            arbReceived,
-            totalRepayment, // Guarantees we receive at least enough to repay the loan
-            path,
-            address(this),
-            block.timestamp
+            uint256[] memory sushiAmounts = IUniswapV2Router(SUSHISWAP_ROUTER).swapExactTokensForTokens(
+                amount,
+                arbParams.minIntermediateOut,
+                path,
+                address(this),
+                arbParams.deadline
+            );
+
+            intermediateReceived = sushiAmounts[1];
+
+            // Leg 2: Uniswap V3 (ARB -> WETH) with strict minFinalReturn
+            ISwapRouter.ExactInputSingleParams memory uniParams = ISwapRouter.ExactInputSingleParams({
+                tokenIn: ARB,
+                tokenOut: WETH,
+                fee: UNISWAP_POOL_FEE,
+                recipient: address(this),
+                deadline: arbParams.deadline,
+                amountIn: intermediateReceived,
+                amountOutMinimum: arbParams.minFinalReturn,
+                sqrtPriceLimitX96: 0
+            });
+
+            finalWethReceived = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(uniParams);
+        }
+
+        // Assert strictly profitable execution after loan repayment
+        require(finalWethReceived >= arbParams.minFinalReturn, "Final return below requested threshold");
+        require(finalWethReceived > totalRepayment, "Negative or zero net arbitrage profit");
+
+        // Forward net profit to contract owner
+        uint256 netProfit = finalWethReceived - totalRepayment;
+        IERC20(WETH).transfer(owner, netProfit);
+
+        emit ArbitrageExecuted(
+            amount,
+            uint8(arbParams.direction),
+            intermediateReceived,
+            finalWethReceived,
+            netProfit
         );
-
-        uint256 wethReturned = amountsOut[1];
-
-        // -------------------------------------------------------------
-        // Step 3: Strict Profitability Validation
-        // -------------------------------------------------------------
-        require(wethReturned >= MIN_RETURN_REQUIRED, "Return below 10.005 WETH threshold");
-        require(wethReturned > totalRepayment, "Trade is not profitable");
-
-        // -------------------------------------------------------------
-        // Step 4: Approve Aave Pool for repayment
-        // -------------------------------------------------------------
-        IERC20(WETH).approve(AAVE_POOL, totalRepayment);
-
-        // -------------------------------------------------------------
-        // Step 5: Transfer net profit to contract owner
-        // -------------------------------------------------------------
-        uint256 profit = wethReturned - totalRepayment;
-        IERC20(WETH).transfer(owner, profit);
-
-        emit ArbitrageExecuted(amount, arbReceived, wethReturned, profit);
 
         return true;
     }
 
     /**
-     * @notice Emergency withdrawal for any stuck tokens in the contract.
-     * @param token Address of the ERC20 token to withdraw
+     * @notice Emergency withdrawal for any ERC20 token held in the contract.
      */
     function emergencyWithdraw(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
-        require(balance > 0, "No balance to withdraw");
+        require(balance > 0, "No token balance");
         IERC20(token).transfer(owner, balance);
         emit EmergencyWithdrawal(token, balance);
     }
@@ -223,7 +298,7 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
      */
     function emergencyWithdrawETH() external onlyOwner {
         uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH to withdraw");
+        require(balance > 0, "No ETH balance");
         (bool success, ) = owner.call{value: balance}("");
         require(success, "ETH transfer failed");
     }

@@ -5,16 +5,24 @@ import dotenv from "dotenv";
 dotenv.config();
 
 // 1. Load required environment variables
-const ARBITRUM_RPC_URL = process.env.ARBITRUM_RPC_URL;
+const ARBITRUM_RPC_URL = process.env.ARBITRUM_RPC_URL || "https://arb1.arbitrum.io/rpc";
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 
-if (!ARBITRUM_RPC_URL || !PRIVATE_KEY || !CONTRACT_ADDRESS) {
-  console.error("FATAL: Missing one or more required environment variables.");
-  console.error(`- ARBITRUM_RPC_URL: ${ARBITRUM_RPC_URL ? "CONFIGURED" : "MISSING"}`);
-  console.error(`- PRIVATE_KEY:       ${PRIVATE_KEY ? "CONFIGURED" : "MISSING"}`);
-  console.error(`- CONTRACT_ADDRESS:  ${CONTRACT_ADDRESS ? "CONFIGURED" : "MISSING"}`);
-  process.exit(1);
+// Check if credentials are provided for live transaction execution
+const isExecutionEnabled = Boolean(
+  PRIVATE_KEY &&
+  PRIVATE_KEY !== "0x0000000000000000000000000000000000000000000000000000000000000000" &&
+  CONTRACT_ADDRESS &&
+  CONTRACT_ADDRESS !== "0x0000000000000000000000000000000000000000"
+);
+
+if (!isExecutionEnabled) {
+  console.log("ℹ️  RUNNING IN FREE LIVE SCANNER MODE (SIMULATION)");
+  console.log("   - Cost: $0.00 (No ETH or deposit required)");
+  console.log("   - Reads real live Arbitrum One blocks & Uniswap V3 ⇄ SushiSwap V2 prices.");
+  console.log("   - When an opportunity occurs, execution will be simulated in console.");
+  console.log("========================================================");
 }
 
 // 2. Exact mainnet contact addresses as constants
@@ -23,13 +31,17 @@ const ARB = "0x912CE59144191C1204E64559FE8253a0e49E6548";
 const UNISWAP_V3_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 const SUSHISWAP_ROUTER = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
 
-// Address sanitizer to handle character typo in prompt ('l' instead of '6') to prevent ethers INVALID_ARGUMENT crashes
-const sanitizeAddress = (addr) => (ethers.isAddress(addr) ? addr : addr.replace(/l/g, "6"));
+// Address sanitizer to handle character typo in prompt ('l' instead of '6') and ensure valid EIP-55 checksum
+const sanitizeAddress = (addr) => {
+  if (!addr) return "0x0000000000000000000000000000000000000000";
+  const cleaned = addr.replace(/l/gi, "6").toLowerCase();
+  return ethers.getAddress(cleaned);
+};
 const WETH_ADDR = sanitizeAddress(WETH);
 const ARB_ADDR = sanitizeAddress(ARB);
 const QUOTER_ADDR = sanitizeAddress(UNISWAP_V3_QUOTER);
 const SUSHISWAP_ADDR = sanitizeAddress(SUSHISWAP_ROUTER);
-const ARBITRAGE_ADDR = sanitizeAddress(CONTRACT_ADDRESS);
+const ARBITRAGE_ADDR = CONTRACT_ADDRESS ? sanitizeAddress(CONTRACT_ADDRESS) : "0x0000000000000000000000000000000000000000";
 
 // 3. Minimal, explicit Ethers.js Contract ABIs
 const UNISWAP_V3_QUOTER_ABI = [
@@ -42,6 +54,7 @@ const SUSHISWAP_ROUTER_ABI = [
 
 const ARBITRAGE_CONTRACT_ABI = [
   "function executeFlashLoan() external",
+  "function executeFlashLoan(uint256 minArbOut, uint256 minWethOut, uint256 deadline) external",
 ];
 
 // Configuration constants
@@ -58,11 +71,14 @@ let arbitrageContract;
 
 try {
   provider = new ethers.JsonRpcProvider(ARBITRUM_RPC_URL);
-  wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
   quoterContract = new ethers.Contract(QUOTER_ADDR, UNISWAP_V3_QUOTER_ABI, provider);
   sushiRouterContract = new ethers.Contract(SUSHISWAP_ADDR, SUSHISWAP_ROUTER_ABI, provider);
-  arbitrageContract = new ethers.Contract(ARBITRAGE_ADDR, ARBITRAGE_CONTRACT_ABI, wallet);
+
+  if (isExecutionEnabled) {
+    wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+    arbitrageContract = new ethers.Contract(ARBITRAGE_ADDR, ARBITRAGE_CONTRACT_ABI, wallet);
+  }
 } catch (initErr) {
   console.error("Failed to initialize Web3 provider, wallet, or contracts:", initErr.message || initErr);
   process.exit(1);
@@ -120,15 +136,27 @@ async function checkArbitrage(blockNumber) {
       console.log(`Minimum Required WETH:     10.005 WETH`);
       console.log(`Estimated Gross Profit:    +${ethers.formatEther(wethReturn - LOAN_AMOUNT)} WETH`);
       console.log(`Estimated Net Profit:      +${ethers.formatEther(wethReturn - MIN_RETURN_THRESHOLD)} WETH`);
-      console.log("Calling executeFlashLoan() on custom arbitrage contract...");
+      if (isExecutionEnabled && arbitrageContract) {
+        console.log("Calling executeFlashLoan() on custom arbitrage contract...");
 
-      try {
-        const tx = await arbitrageContract.executeFlashLoan();
-        console.log(`Transaction dispatched. Hash: ${tx.hash}`);
-        const receipt = await tx.wait();
-        console.log(`Transaction confirmed in block #${receipt.blockNumber}! Gas Used: ${receipt.gasUsed.toString()}`);
-      } catch (txError) {
-        console.error("Execution failed on executeFlashLoan():", txError.message || txError);
+        try {
+          let tx;
+          // Check if contract has parameters (minArbOut, minWethOut, deadline) or is parameterless
+          try {
+            const deadline = Math.floor(Date.now() / 1000) + 120; // 2 minute buffer
+            tx = await arbitrageContract.executeFlashLoan(arbOut, MIN_RETURN_THRESHOLD, deadline);
+          } catch (callErr) {
+            // Fallback to parameterless executeFlashLoan()
+            tx = await arbitrageContract.executeFlashLoan();
+          }
+          console.log(`Transaction dispatched. Hash: ${tx.hash}`);
+          const receipt = await tx.wait();
+          console.log(`Transaction confirmed in block #${receipt.blockNumber}! Gas Used: ${receipt.gasUsed.toString()}`);
+        } catch (txError) {
+          console.error("Execution failed on executeFlashLoan():", txError.message || txError);
+        }
+      } else {
+        console.log("ℹ️ [SIMULATION MODE] Opportunity detected! Flash loan execution would trigger on-chain once keys are configured.");
       }
 
       console.log("========================================================\n");
@@ -147,8 +175,14 @@ async function checkArbitrage(blockNumber) {
 async function main() {
   console.log("========================================================");
   console.log("🚀 Arbitrum WETH/ARB MEV Arbitrage Monitor Started");
-  console.log(`Signer Address:      ${wallet.address}`);
-  console.log(`Target Contract:     ${ARBITRAGE_ADDR}`);
+  if (isExecutionEnabled) {
+    console.log(`Mode:                LIVE ON-CHAIN EXECUTION`);
+    console.log(`Signer Address:      ${wallet.address}`);
+    console.log(`Target Contract:     ${ARBITRAGE_ADDR}`);
+  } else {
+    console.log(`Mode:                FREE LIVE SCANNER (Zero Funds Required - $0.00)`);
+    console.log(`Live Network:        Arbitrum One (ChainID: 42161)`);
+  }
   console.log(`Uniswap V3 Quoter:   ${QUOTER_ADDR}`);
   console.log(`SushiSwap Router:    ${SUSHISWAP_ADDR}`);
   console.log(`Loan Amount:         ${ethers.formatEther(LOAN_AMOUNT)} WETH`);

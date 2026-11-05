@@ -1,11 +1,16 @@
 // scripts/checkBalance.js
 import { ethers } from "ethers";
-import dotenv from "dotenv";
 
-dotenv.config();
+// Load dotenv dynamically only in Node.js environments (prevents browser/Remix bundler crashes on 'child_process')
+if (typeof process !== "undefined" && process?.versions?.node) {
+  try {
+    const dotenv = await import("dotenv");
+    dotenv.default?.config?.();
+  } catch (_) {}
+}
 
-const RPC_URL = process.env.ARBITRUM_RPC_URL || "https://arb1.arbitrum.io/rpc";
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const RPC_URL = (typeof process !== "undefined" && process.env?.ARBITRUM_RPC_URL) || "https://arb1.arbitrum.io/rpc";
+const PRIVATE_KEY = typeof process !== "undefined" ? process.env?.PRIVATE_KEY : null;
 
 async function checkDeployerBalance() {
   const provider = new ethers.JsonRpcProvider(RPC_URL);

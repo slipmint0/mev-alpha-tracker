@@ -2,7 +2,7 @@
 import { ethers } from "ethers";
 
 const RPC_URL = "https://arb1.arbitrum.io/rpc";
-const targetAddress = process.argv[2] || "0x92c70a2fe1274ee258a0fb7dbff5f89bb2e4bbf9";
+const targetAddress = (typeof process !== "undefined" && process.argv?.[2]) || "0x92c70a2fe1274ee258a0fb7dbff5f89bb2e4bbf9";
 
 async function verifyContractOnArbitrum() {
   const provider = new ethers.JsonRpcProvider(RPC_URL);

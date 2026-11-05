@@ -256,7 +256,7 @@ interface IUniswapV2Router {
 contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
     address public immutable owner;
 
-    address public constant WETH = 0x82aF49447D8a07e3bd95BD0d56f352415231C611;
+    address public constant WETH = 0x82aF49447D8A07E3bD95Bd0d56f352415231c611;
     address public constant ARB = 0x912CE59144191C1204E64559FE8253a0e49E6548;
     address public constant AAVE_POOL = 0x794a61358D6845594F94dc1DB02A252b5b4814aD;
     address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;

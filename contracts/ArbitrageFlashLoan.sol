@@ -78,7 +78,7 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
     address public immutable owner;
 
     // Arbitrum One Canonical Mainnet Addresses
-    address public constant WETH = 0x82aF49447D8a07e3bd95BD0d56f352415231C611;
+    address public constant WETH = 0x82aF49447D8A07E3bD95Bd0d56f352415231c611;
     address public constant ARB = 0x912CE59144191C1204E64559FE8253a0e49E6548;
     
     // Aave V3 Pool on Arbitrum One

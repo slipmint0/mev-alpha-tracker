@@ -355,6 +355,7 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
 export default function App() {
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"code" | "contract" | "deploy" | "simulation" | "architecture">("deploy");
+  const [walletStatus, setWalletStatus] = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
   const [simRunning, setSimRunning] = useState(false);
   const [simLogs, setSimLogs] = useState<string[]>([
     "Arbitrum WETH/ARB MEV Arbitrage Monitor Initialized.",
@@ -363,6 +364,43 @@ export default function App() {
   const [blockHeight, setBlockHeight] = useState(254890120);
   const [simulatedUniArb, setSimulatedUniArb] = useState(19500);
   const [simulatedSushiReturn, setSimulatedSushiReturn] = useState(10.002);
+
+  const handleAddArbitrumToMetaMask = async () => {
+    if (typeof window !== "undefined" && (window as any).ethereum) {
+      try {
+        await (window as any).ethereum.request({
+          method: "wallet_addEthereumChain",
+          params: [
+            {
+              chainId: "0xa4b1", // 42161 in hex
+              chainName: "Arbitrum One",
+              nativeCurrency: {
+                name: "Ether",
+                symbol: "ETH",
+                decimals: 18,
+              },
+              rpcUrls: ["https://arb1.arbitrum.io/rpc"],
+              blockExplorerUrls: ["https://arbiscan.io/"],
+            },
+          ],
+        });
+        setWalletStatus({
+          message: "Arbitrum One network successfully configured and selected in MetaMask!",
+          type: "success",
+        });
+      } catch (err: any) {
+        setWalletStatus({
+          message: err.message || "Failed to add Arbitrum One to MetaMask.",
+          type: "error",
+        });
+      }
+    } else {
+      setWalletStatus({
+        message: "MetaMask extension not detected in your browser. Install it from metamask.io.",
+        type: "info",
+      });
+    }
+  };
 
   useEffect(() => {
     let interval: NodeJS.Timeout;
@@ -516,20 +554,94 @@ export default function App() {
               <div>
                 <h2 className="text-lg font-bold text-white flex items-center gap-2">
                   <ShieldCheck className="h-5 w-5 text-cyan-400" />
-                  Step-by-Step Contract Deployment via Remix IDE
+                  MetaMask Setup & Contract Deployment
                 </h2>
                 <p className="text-xs text-slate-400 mt-1">
-                  Follow these 5 straightforward steps to deploy <span className="font-mono text-cyan-300">ArbitrageFlashLoan.sol</span> on Arbitrum One.
+                  Connect your MetaMask wallet to <span className="font-semibold text-cyan-300">Arbitrum One</span> and deploy <span className="font-mono text-cyan-300">ArbitrageFlashLoan.sol</span>.
                 </p>
               </div>
-              <a
-                href="https://remix.ethereum.org"
-                target="_blank"
-                rel="noreferrer"
-                className="px-4 py-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-lg text-xs font-semibold flex items-center gap-2 transition w-fit shadow-md shadow-cyan-900/30"
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleAddArbitrumToMetaMask}
+                  className="px-3 py-2 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-md shadow-orange-900/30 cursor-pointer"
+                >
+                  <Zap className="h-3.5 w-3.5" />
+                  1-Click Add Arbitrum to MetaMask
+                </button>
+                <a
+                  href="https://remix.ethereum.org"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+                >
+                  Open Remix IDE <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+            </div>
+
+            {/* Wallet Status Banner */}
+            {walletStatus && (
+              <div
+                className={`p-3 rounded-lg text-xs flex items-center justify-between border ${
+                  walletStatus.type === "success"
+                    ? "bg-emerald-950/60 border-emerald-800 text-emerald-300"
+                    : walletStatus.type === "error"
+                    ? "bg-rose-950/60 border-rose-800 text-rose-300"
+                    : "bg-cyan-950/60 border-cyan-800 text-cyan-300"
+                }`}
               >
-                Open Remix IDE <ExternalLink className="h-3.5 w-3.5" />
-              </a>
+                <span>{walletStatus.message}</span>
+                <button
+                  onClick={() => setWalletStatus(null)}
+                  className="text-slate-400 hover:text-white text-xs ml-4"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            {/* Network Parameters Card */}
+            <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-cyan-400"></span>
+                  Required Network: Arbitrum One
+                </h3>
+                <span className="text-xs text-slate-400">Gas Asset: <strong className="text-cyan-300">ETH (on Arbitrum L2)</strong></span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                <div className="p-2.5 bg-slate-900/90 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block text-[11px]">Network Name</span>
+                  <span className="font-mono text-slate-200 font-semibold">Arbitrum One</span>
+                </div>
+                <div className="p-2.5 bg-slate-900/90 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block text-[11px]">Chain ID</span>
+                  <span className="font-mono text-cyan-300 font-semibold">42161 (0xa4b1)</span>
+                </div>
+                <div className="p-2.5 bg-slate-900/90 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block text-[11px]">Currency Symbol</span>
+                  <span className="font-mono text-emerald-300 font-semibold">ETH</span>
+                </div>
+                <div className="p-2.5 bg-slate-900/90 rounded-lg border border-slate-800">
+                  <span className="text-slate-500 block text-[11px]">Block Explorer</span>
+                  <span className="font-mono text-slate-300 truncate block">arbiscan.io</span>
+                </div>
+              </div>
+              <div className="p-2.5 bg-slate-900/90 rounded-lg border border-slate-800 text-xs flex items-center justify-between">
+                <div>
+                  <span className="text-slate-500 block text-[11px]">RPC URL</span>
+                  <span className="font-mono text-cyan-300">https://arb1.arbitrum.io/rpc</span>
+                </div>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText("https://arb1.arbitrum.io/rpc");
+                    setWalletStatus({ message: "RPC URL copied to clipboard!", type: "info" });
+                  }}
+                  className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition"
+                >
+                  Copy RPC
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

@@ -132,7 +132,6 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
      * @param amount The borrowed amount (10 WETH)
      * @param premium The protocol fee (0.009 WETH)
      * @param initiator The address that initiated the flash loan
-     * @param params Additional calldata (unused)
      */
     function executeOperation(
         address asset,

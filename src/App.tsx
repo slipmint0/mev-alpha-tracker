@@ -287,7 +287,7 @@ contract ArbitrageFlashLoan is IFlashLoanSimpleReceiver {
         uint256 amount,
         uint256 premium,
         address initiator,
-        bytes calldata params
+        bytes calldata /* params */
     ) external override returns (bool) {
         require(msg.sender == AAVE_POOL, "Caller must be Aave Pool");
         require(initiator == address(this), "Initiator must be this contract");
